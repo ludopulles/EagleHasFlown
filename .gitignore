@@ -52,6 +52,9 @@ Mkfile.old
 dkms.conf
 
 
+# Build files:
+PQgenKAT_sign3
+PQgenKAT_sign5
 test/test_eaglesign3
 test/test_eaglesign5
 test/test_speed3

@@ -101,8 +101,9 @@ void determine_c(polyvecl *C, uint8_t *m, size_t mlen, uint8_t *r, polyvecl *Z, 
 	polyvecl_invntt_tomont(C);
 }
 
-void private_key_recovery(polyvecl *predicted_G, int num_sigs, void (*gensig)(uint8_t*, size_t*, uint8_t*))
+void private_key_recovery(polyvecl *predicted_G, polyvecl *predicted_D, int num_sigs, void (*gensig)(uint8_t*, size_t*, uint8_t*))
 {
+	// ================================================================================
 	uint8_t msg[MSGLEN], sig[CRYPTO_EAGLESIGN_BYTES];
 	size_t msglen;
 
@@ -112,12 +113,13 @@ void private_key_recovery(polyvecl *predicted_G, int num_sigs, void (*gensig)(ui
 	polyveck sig_W;
 
 	// Statistics on the signatures:
-	long long sum_c = 0, sum_Z[N] = {};
-	double recG[N] = {};
+	long long num_traces[L] = {}, traceG[L][L][N] = {}, traceD[K][L][N] = {};
+	double recG[N], recD[N];
 
+
+	// ================================================================================
 	// It's quite likely that you can extend the attack to L = 2.
 	// For now, the goal is only to illustrate the weakness for L = 1.
-
 	unpack_pk(rho, E, public_key);
 	/* Expand matrix A in NTT form*/
 	polyvec_matrix_expand(A, rho);
@@ -129,63 +131,107 @@ void private_key_recovery(polyvecl *predicted_G, int num_sigs, void (*gensig)(ui
 		assert(!polyvec_chknorms(&sig_Z, &sig_W));
 
 		determine_c(&sig_C, msg, msglen, sig_r, &sig_Z, &sig_W);
-
 		polyvecl_invntt_tomont(&sig_Z);
+		polyveck_invntt_tomont(&sig_W);
 
-		// L = K = 1:
-		for (int idx_c = 0; idx_c < N; idx_c++)
-		if (sig_C.vec[0].coeffs[idx_c] != 0) {
-			long long c0 = sig_C.vec[0].coeffs[idx_c];
-			sum_c++;
-			for (int j = 0; j < N; j++) {
-				int idx_z = idx_c + j, sign = 1;
-				if (idx_z >= N) idx_z -= N, sign = -sign;
-				long long zj = sign * (long long)sig_Z.vec[0].coeffs[idx_z];
-				sum_Z[j] += c0 * zj;
+		for (int lu = 0; lu < L; lu++) {
+
+			for (int idx_c = 0; idx_c < N; idx_c++) {
+				if (sig_C.vec[lu].coeffs[idx_c] != 0) {
+					long long c0 = sig_C.vec[lu].coeffs[idx_c];
+					num_traces[lu]++;
+
+					// Gather statistics on G:
+					for (int lz = 0; lz < L; lz++) {
+						for (int j = 0; j < N; j++) {
+							int idx_z = idx_c + j, sign = 1;
+							if (idx_z >= N) idx_z -= N, sign = -sign;
+							long long zj = sign * (long long)sig_Z.vec[lz].coeffs[idx_z];
+							traceG[lz][lu][j] += c0 * zj;
+						}
+					}
+
+					// Gather statistics on D:
+					for (int lw = 0; lw < K; lw++) {
+						for (int j = 0; j < N; j++) {
+							int idx_w = idx_c + j, sign = 1;
+							if (idx_w >= N) idx_w -= N, sign = -sign;
+							long long wj = -sign * (long long)sig_W.vec[lw].coeffs[idx_w];
+							traceD[lw][lu][j] += c0 * wj;
+						}
+					}
+
+				}
 			}
 		}
 	}
 
 	// Recover the secret key.
-	printf("based on %lld nonzero c_0's: G[0] ~ (", sum_c);
+	for (int lu = 0; lu < L; lu++) assert(num_traces[lu] == TAU * num_sigs);
+	// printf("Took %lld traces\n", num_traces[0]);
 
-	double norm_recG = 0;
-	for (int i = 0; i < N; i++) {
-		recG[i] = ((double)sum_Z[i]) / sum_c;
-		norm_recG += recG[i] * recG[i];
-	}
-	for (int i = 0; i < N; i++) {
-		recG[i] *= sqrt(2 * N / (3 * norm_recG));
-		predicted_G[0].vec[0].coeffs[i] = lround(recG[i]);
+	for (int lu = 0; lu < L; lu++) {
+
+		// Recover G:
+		for (int lz = 0; lz < L; lz++) {
+			double norm_recG = 0;
+			for (int i = 0; i < N; i++) {
+				recG[i] = ((double)traceG[lz][lu][i]) / num_traces[lu];
+				norm_recG += recG[i] * recG[i];
+			}
+			for (int i = 0; i < N; i++) {
+				// Formula used from Mehdi's code:
+				recG[i] *= sqrt(2 * N / (3 * norm_recG));
+				predicted_G[lz].vec[lu].coeffs[i] = lround(recG[i]);
+			}
+		}
+
+		// Recover D:
+		for (int lw = 0; lw < K; lw++) {
+			double norm_recD = 0;
+			for (int i = 0; i < N; i++) {
+				recD[i] = ((double)traceD[lw][lu][i]) / num_traces[lu];
+				norm_recD += recD[i] * recD[i];
+			}
+			for (int i = 0; i < N; i++) {
+				// Formula used from Mehdi's code:
+				recD[i] *= sqrt(2 * N / (3 * norm_recD));
+				predicted_D[lw].vec[lu].coeffs[i] = lround(recD[i]);
+			}
+		}
+
 	}
 }
 
-void compare_Gs(const uint8_t *private_key, const polyvecl *predicted_G)
+void compare_keys(const uint8_t *private_key, const polyvecl *predicted_G, const polyvecl *predicted_D)
 {
 	uint8_t rho[SEEDBYTES], tr[SEEDBYTES];
 	polyvecl G[L], D[K];
 	unpack_sk(rho, tr, G, D, private_key);
  
-	// EagleSign3: L = K = 1
+	for (int lu = 0; lu < L; lu++) {
 
-	int correct[3] = {}, wrong[3] = {};
-	int occ[3][3] = {};
+		// Show results for G:
+		for (int lz = 0; lz < L; lz++) {
+			int n_correct = 0;
+			for (int i = 0; i < N; i++) {
+				int aGi = G[lz].vec[lu].coeffs[i];
+				int pGi = predicted_G[lz].vec[lu].coeffs[i];
+				n_correct += (aGi == pGi);
+			}
+			printf("%d out of %d coefficients of G[%d,%d] are recovered succesfully.\n", n_correct, N, lz, lu);
+		}
 
-	for (int i = 0; i < N; i++) {
-		int Gi = G[0].vec[0].coeffs[i];
-		int pGi = predicted_G[0].vec[0].coeffs[i];
-
-		// if (Gi == pGi) correct[Gi+1]++;
-		// else wrong[Gi+1]++;
-		occ[Gi + 1][pGi + 1]++;
-	}
-
-	printf("Actual G[i] / pred[i]\n");
-	for (int i = -1; i <= 1; i++) {
-		printf("%3d: ", i);
-		for (int j = -1; j <= 1; j++)
-			printf("%4d", occ[i+1][j+1]);
-		printf("\n");
+		// Show results for D:
+		for (int lw = 0; lw < L; lw++) {
+			int n_correct = 0;
+			for (int i = 0; i < N; i++) {
+				int aDi = D[lw].vec[lu].coeffs[i];
+				int pDi = predicted_D[lw].vec[lu].coeffs[i];
+				n_correct += (aDi == pDi);
+			}
+			printf("%d out of %d coefficients of D[%d,%d] are recovered succesfully.\n", n_correct, N, lw, lu);
+		}
 	}
 
 }
@@ -208,7 +254,7 @@ void generate_msg_sig(uint8_t *msg, size_t *msglen, uint8_t sig[CRYPTO_EAGLESIGN
 
 signed main(int argc, char **argv) {
 	int num_sigs = argc > 1 ? atoi(argv[1]) : 1000;
-	polyvecl predicted_G[L];
+	polyvecl predicted_G[L], predicted_D[K];
 
 	srand(time(NULL));
 
@@ -216,13 +262,13 @@ signed main(int argc, char **argv) {
 	crypto_sign_keypair(public_key, private_key);
 
 	// Recover G:
-	private_key_recovery(predicted_G, num_sigs, generate_msg_sig);
+	private_key_recovery(predicted_G, predicted_D, num_sigs, generate_msg_sig);
 
 	// Print the actual private key.
 	// print_G_and_D(private_key);
 
 	// Compare G and predicted_G:
-	compare_Gs(private_key, predicted_G);
+	compare_keys(private_key, predicted_G, predicted_D);
 
 	return 0;
 }
